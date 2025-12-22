@@ -3,38 +3,18 @@
 # ==============================================================================
 # Dev Cleaner - Comprehensive Mac Developer Cleanup
 # ==============================================================================
-# Merged and enhanced version featuring granular control, disk space reporting,
-# and safe cleanup of various developer and system caches.
+# A professional tool to reclaim disk space by clearing developer and system 
+# caches while preserving project source code and critical data.
 # ==============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
-VERSION="2.1.0"
-
-# --- Configuration & Flags ---
-DRY_RUN=false
-FORCE=false
-CLEAN_XCODE=false
-CLEAN_SIM=false
-CLEAN_CACHES=false
-CLEAN_BREW=false
-CLEAN_PODS=false
-CLEAN_NODE=false
-CLEAN_ANDROID=false
-CLEAN_BUN=false
-CLEAN_PNPM=false
-CLEAN_GO=false
-CLEAN_PUB=false
-CLEAN_SWIFT=false
-CLEAN_VSCODE=false
-CLEAN_DOCKER=false
-CLEAN_ALL=true
-
-# Path Definitions
-XCODE_DIR="$HOME/Library/Developer/Xcode"
+# --- Constants & Configuration ---
+VERSION="3.0.0"
+DARWIN_CACHE_DIR=$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || echo "")
+LIB_CACHE_DIR="$HOME/Library/Caches"
+XCODE_DEV_DIR="$HOME/Library/Developer/Xcode"
 SIM_DIR="$HOME/Library/Developer/CoreSimulator"
-CACHE_DIR="$HOME/Library/Caches"
-LOG_DIR="$HOME/Library/Logs"
 
 # --- UI & Colors ---
 BOLD='\033[1m'
@@ -44,27 +24,80 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-log()     { echo -e "${BLUE}➡️  $@${NC}"; }
-success() { echo -e "${GREEN}✅ $@${NC}"; }
-warn()    { echo -e "${YELLOW}⚠️  $@${NC}"; }
-error()   { echo -e "${RED}❌ $@${NC}"; }
-header()  { echo -e "\n${BOLD}${BLUE}=== $@ ===${NC}"; }
+# --- State ---
+DRY_RUN=false
+FORCE=false
+LIST_MODE=false
+LOG_FILE=""
+CLEAN_ALL=true
+SELECTED_MODULES=()
+
+# --- Module Registry ---
+# Key: ID
+# Value: Descriptive Name | Check Command | Pre-Cleanup Command | Cache Paths (comma separated)
+declare -A MODULES
+MODULES[xcode]="Xcode Data|xcode-select||$XCODE_DEV_DIR/DerivedData/*,$XCODE_DEV_DIR/Archives/*,$XCODE_DEV_DIR/iOS DeviceSupport/*,$XCODE_DEV_DIR/Logs/*,$LIB_CACHE_DIR/com.apple.dt.Xcode"
+MODULES[simulators]="iOS Simulators|||$SIM_DIR/Caches,$SIM_DIR/Devices/*/data/Library/Caches"
+MODULES[brew]="Homebrew|brew|brew cleanup -s; brew bundle cleanup --force|$LIB_CACHE_DIR/Homebrew"
+MODULES[pods]="CocoaPods|pod|pod cache clean --all|$LIB_CACHE_DIR/CocoaPods"
+MODULES[node]="NPM & Yarn|npm||$HOME/.npm/_cacache"
+MODULES[yarn]="Yarn|yarn|yarn cache clean|"
+MODULES[pnpm]="pnpm|pnpm|pnpm store prune|"
+MODULES[bun]="Bun|bun|bun pm cache clean|$HOME/.bun/install/cache/*"
+MODULES[go]="Go|go|go clean -cache -modcache|"
+MODULES[flutter]="Flutter/Dart|flutter|flutter pub cache clean --force|"
+MODULES[dart]="Dart|dart|dart pub cache clean --force|"
+MODULES[swift]="Swift PM|||$LIB_CACHE_DIR/org.swift.swiftpm,$XCODE_DEV_DIR/DerivedData/*/SourcePackages"
+MODULES[vscode]="VS Code|||$HOME/Library/Application Support/Code/Cache/*,$HOME/Library/Application Support/Code/CachedData/*,$HOME/Library/Application Support/Code/logs/*"
+MODULES[docker]="Docker|docker|docker system prune -f -a|"
+MODULES[android]="Android & Gradle|||$HOME/.gradle/caches,$HOME/.android/build-cache,$LIB_CACHE_DIR/Google/AndroidStudio*"
+MODULES[python]="Python|||**/__pycache__,**/.pytest_cache,$HOME/Library/Caches/pip"
+MODULES[system]="System Caches|||$LIB_CACHE_DIR/*,$HOME/Library/Logs/*,$HOME/.Trash/*"
 
 # --- Utility Functions ---
+
+log()     { 
+    local msg="➡️  $*"
+    echo -e "${BLUE}${msg}${NC}"
+    [[ -n "$LOG_FILE" ]] && echo "[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $*" >> "$LOG_FILE"
+}
+success() { 
+    local msg="✅ $*"
+    echo -e "${GREEN}${msg}${NC}"
+    [[ -n "$LOG_FILE" ]] && echo "[$(date +'%Y-%m-%d %H:%M:%S')] SUCCESS: $*" >> "$LOG_FILE"
+}
+warn()    { 
+    local msg="⚠️  $*"
+    echo -e "${YELLOW}${msg}${NC}"
+    [[ -n "$LOG_FILE" ]] && echo "[$(date +'%Y-%m-%d %H:%M:%S')] WARN: $*" >> "$LOG_FILE"
+}
+error()   { 
+    local msg="❌ $*"
+    echo -e "${RED}${msg}${NC}" >&2
+    [[ -n "$LOG_FILE" ]] && echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $*" >> "$LOG_FILE"
+}
+header()  { 
+    echo -e "\n${BOLD}${BLUE}=== $* ===${NC}"
+    [[ -n "$LOG_FILE" ]] && echo -e "\n=== $* ===" >> "$LOG_FILE"
+}
+
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
 size_of() {
     local path="$1"
-    if [[ -e "$path" ]]; then
-        # Handle wildcards by checking if any files exist
-        if [[ "$path" == *"*"* ]]; then
-            # Use find to get total size of expanded wildcard
-            find ${path%/*} -name "${path##*/}" -exec du -sk {} + 2>/dev/null | awk '{sum+=$1} END {print sum}' || echo "0"
-        else
-            du -sk "$path" 2>/dev/null | awk '{print $1}' || echo "0"
-        fi
+    # Special handling for wildcards to avoid shell expansion issues in du
+    if [[ "$path" == *"*"* ]]; then
+        # Use find to get the size of objects matching the glob
+        # We need to be careful with eval/globbing
+        (
+            shopt -s globstar nullglob
+            # shellcheck disable=SC2086
+            du -sk $path 2>/dev/null | awk '{sum+=$1} END {print sum+0}'
+        )
+    elif [[ -e "$path" ]]; then
+        du -sk "$path" 2>/dev/null | awk '{print $1}' || echo "0"
     else
         echo "0"
     fi
@@ -73,41 +106,57 @@ size_of() {
 format_size() {
     local kbytes="$1"
     if [ "$kbytes" -ge 1048576 ]; then
-        echo "$(echo "scale=2; $kbytes / 1048576" | bc) GB"
+        printf "%.2f GB\n" "$(echo "scale=2; $kbytes / 1048576" | bc 2>/dev/null || echo "$((kbytes / 1048576))")"
     elif [ "$kbytes" -ge 1024 ]; then
-        echo "$(echo "scale=2; $kbytes / 1024" | bc) MB"
+        printf "%.2f MB\n" "$(echo "scale=2; $kbytes / 1024" | bc 2>/dev/null || echo "$((kbytes / 1024))")"
     else
         echo "${kbytes} KB"
     fi
 }
 
-TOTAL_KBYTES_CLEARED=0
-
-cleanup_item() {
+validate_path() {
     local path="$1"
-    local description="$2"
+    # Basic safety checks
+    [[ -z "$path" ]] && return 1
+    [[ "$path" == "/" ]] && return 1
+    [[ "$path" == "$HOME" ]] && return 1
+    [[ "$path" == "$HOME/Documents" ]] && return 1
+    [[ "$path" == "$HOME/Desktop" ]] && return 1
     
-    # Expand wildcards if present
-    local size_kb
-    size_kb=$(size_of "$path")
+    # Ensure it's in a known cache/temp directory
+    if [[ "$path" == "$HOME/Library/Caches"* ]] || \
+       [[ "$path" == "$HOME/Library/Developer"* ]] || \
+       [[ "$path" == "$HOME/Library/Logs"* ]] || \
+       [[ "$path" == "$HOME/Library/Application Support/Code"* ]] || \
+       [[ "$path" == "$HOME/.npm"* ]] || \
+       [[ "$path" == "$HOME/.gradle"* ]] || \
+       [[ "$path" == "$HOME/.android"* ]] || \
+       [[ "$path" == "$HOME/.bun"* ]] || \
+       [[ "$path" == "$HOME/.Trash"* ]] || \
+       [[ "$path" == "/var/folders/"* ]]; then
+        return 0
+    fi
     
-    if [[ -e "$path" ]] || [[ "$path" == *"*"* && $(ls $path 2>/dev/null | wc -l) -gt 0 ]]; then
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would remove: $description ($(format_size $size_kb))"
-        else
-            log "Cleaning: $description ($(format_size $size_kb))"
-            # Suppress errors for system folders (Operation not permitted)
-            if [[ "$path" == *"*"* ]]; then
-                sh -c "rm -rf $path" 2>/dev/null || true
-            else
-                rm -rf "$path" 2>/dev/null || true
-            fi
-            TOTAL_KBYTES_CLEARED=$((TOTAL_KBYTES_CLEARED + size_kb))
-        fi
+    # Handle relative-looking patterns like **/__pycache__
+    if [[ "$path" == "**/"* ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+run_cleanup_cmd() {
+    local cmd="$1"
+    local name="$2"
+    if $DRY_RUN; then
+        log "[Dry-Run] Would run: $cmd"
+    else
+        log "Running $name cleanup command: $cmd"
+        # Split command and arguments properly if needed, but eval is easier for complex pipes
+        eval "$cmd" 2>/dev/null || warn "Command failed: $cmd"
     fi
 }
 
-# --- Usage ---
 usage() {
     cat <<EOF
 Dev Cleaner v$VERSION
@@ -116,260 +165,180 @@ Usage:
   $(basename "$0") [options]
 
 Options:
-  --all           Clean everything (default)
-  --xcode         Clean Xcode data (DerivedData, Archives, Logs)
-  --simulators    Clean iOS simulators data
-  --caches        Clean general user caches
-  --brew          Clean Homebrew cache
-  --pods          Clean CocoaPods cache
-  --node          Clean NPM/Yarn caches
-  --bun           Clean Bun cache
-  --pnpm          Clean pnpm store
-  --go            Clean Go cache
-  --pub           Clean Dart/Pub cache
-  --swift         Clean Swift PM cache
-  --vscode        Clean VS Code caches
-  --docker        Clean Docker images/containers (Destructive!)
-  -n, --dry-run   Show what would be deleted without deleting
+  --all           Clean all detected dev modules (default)
+  --list          List detected caches and their estimated sizes
+  --xcode         Clean Xcode data
+  --simulators    Clean iOS simulators
+  --brew          Clean Homebrew
+  --pods          Clean CocoaPods
+  --node          Clean NPM & Yarn
+  --bun           Clean Bun
+  --pnpm          Clean pnpm
+  --go            Clean Go
+  --flutter       Clean Flutter/Dart
+  --swift         Clean Swift PM
+  --vscode        Clean VS Code
+  --docker        Clean Docker (system prune)
+  --android       Clean Android & Gradle
+  --python        Clean Python caches
+  --system        Clean system caches & Trash
+  -n, --dry-run   Show what would be cleaned without deleting
   -y, --force     Skip confirmation prompt
+  --log FILE      Log output to specified file
   -h, --help      Show this help message
-
-Examples:
-  $(basename "$0") --dry-run
-  $(basename "$0") --xcode --simulators
 EOF
     exit 0
 }
 
+# --- Pre-flight Checks ---
+
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    error "This script should not be run as root."
+    exit 2
+fi
+
+if [[ "$(uname)" != "Darwin" ]]; then
+    error "This script is only compatible with macOS."
+    exit 1
+fi
+
 # --- Argument Parsing ---
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --xcode) CLEAN_XCODE=true; CLEAN_ALL=false ;;
-        --simulators) CLEAN_SIM=true; CLEAN_ALL=false ;;
-        --caches) CLEAN_CACHES=true; CLEAN_ALL=false ;;
-        --brew) CLEAN_BREW=true; CLEAN_ALL=false ;;
-        --pods) CLEAN_PODS=true; CLEAN_ALL=false ;;
-        --node) CLEAN_NODE=true; CLEAN_ALL=false ;;
-        --bun) CLEAN_BUN=true; CLEAN_ALL=false ;;
-        --pnpm) CLEAN_PNPM=true; CLEAN_ALL=false ;;
-        --go) CLEAN_GO=true; CLEAN_ALL=false ;;
-        --pub) CLEAN_PUB=true; CLEAN_ALL=false ;;
-        --swift) CLEAN_SWIFT=true; CLEAN_ALL=false ;;
-        --vscode) CLEAN_VSCODE=true; CLEAN_ALL=false ;;
-        --docker) CLEAN_DOCKER=true; CLEAN_ALL=false ;;
         --all) CLEAN_ALL=true ;;
+        --list) LIST_MODE=true ;;
+        --xcode|--simulators|--brew|--pods|--node|--bun|--pnpm|--go|--flutter|--dart|--swift|--vscode|--docker|--android|--python|--system)
+            CLEAN_ALL=false
+            SELECTED_MODULES+=("${1#--}")
+            ;;
         -n|--dry-run) DRY_RUN=true ;;
         -y|--force) FORCE=true ;;
+        --log) LOG_FILE="$2"; shift ;;
         -h|--help) usage ;;
         *) warn "Unknown option: $1"; usage ;;
     esac
     shift
 done
 
-# --- Initialize ---
+# --- Execution Logic ---
+
+if $CLEAN_ALL; then
+    SELECTED_MODULES=("${!MODULES[@]}")
+fi
+
 header "Dev Cleaner v$VERSION"
-[ "$DRY_RUN" = true ] && warn "DRY-RUN MODE ENABLED - No files will be deleted"
 
-# Display Warning & Selected Categories
-echo -e "${BOLD}${RED}WARNING: This script will delete various developer caches and temporary data.${NC}"
-echo -e "Categories selected for cleaning:"
-$CLEAN_ALL && echo "  - ALL (Everything below)" || {
-    $CLEAN_XCODE && echo "  - Xcode Data"
-    $CLEAN_SIM && echo "  - iOS Simulators"
-    $CLEAN_BREW && echo "  - Homebrew"
-    $CLEAN_PODS && echo "  - CocoaPods"
-    $CLEAN_NODE && echo "  - NPM & Yarn"
-    $CLEAN_BUN && echo "  - Bun"
-    $CLEAN_PNPM && echo "  - pnpm"
-    $CLEAN_GO && echo "  - Go"
-    $CLEAN_PUB && echo "  - Dart & Pub"
-    $CLEAN_SWIFT && echo "  - Swift PM"
-    $CLEAN_VSCODE && echo "  - VS Code"
-    $CLEAN_DOCKER && echo "  - Docker (Prune -a)"
-    $CLEAN_CACHES && echo "  - System & App Caches"
-}
-echo ""
+if [[ -n "$LOG_FILE" ]]; then
+    touch "$LOG_FILE" 2>/dev/null || { error "Cannot write to log file: $LOG_FILE"; exit 1; }
+    log "Logging to $LOG_FILE"
+fi
 
-if [[ "$DRY_RUN" = false && "$FORCE" = false ]]; then
-    echo -ne "${BOLD}${YELLOW}Are you sure you want to continue? (y/N): ${NC}"
-    read -r confirm
+# Filter modules based on tool existence
+FINAL_MODULES=()
+for mod in "${SELECTED_MODULES[@]}"; do
+    IFS='|' read -r name check cmd paths <<< "${MODULES[$mod]}"
+    if [[ -z "$check" ]] || command_exists "$check"; then
+        FINAL_MODULES+=("$mod")
+    fi
+done
+
+# Detect sizes and paths
+TOTAL_RECLAIMABLE_KB=0
+DETECTED_ITEMS=() # Format: "ModID|Type|Target|SizeKB|Name" (Type: CMD or PATH)
+
+for mod in "${FINAL_MODULES[@]}"; do
+    IFS='|' read -r name check cmd paths <<< "${MODULES[$mod]}"
+    
+    # Handle Commands
+    if [[ -n "$cmd" ]]; then
+        # Commands are hard to estimate size for, so we just mark them
+        DETECTED_ITEMS+=("$mod|CMD|$cmd|0|$name")
+    fi
+
+    # Handle Paths
+    IFS=',' read -ra ADDR <<< "$paths"
+    for p in "${ADDR[@]}"; do
+        # We don't resolve paths yet as they might contain wildcards
+        sz=$(size_of "$p")
+        if [[ "$sz" -gt 0 ]]; then
+            DETECTED_ITEMS+=("$mod|PATH|$p|$sz|$name")
+            TOTAL_RECLAIMABLE_KB=$((TOTAL_RECLAIMABLE_KB + sz))
+        fi
+    done
+done
+
+# List Mode
+if $LIST_MODE; then
+    header "Detected Developer Caches"
+    if [[ ${#DETECTED_ITEMS[@]} -eq 0 ]]; then
+        log "No developer caches detected."
+    else
+        printf "${BOLD}%-20s %-15s %s${NC}\n" "Module" "Size" "Detail"
+        for entry in "${DETECTED_ITEMS[@]}"; do
+            IFS='|' read -r mod type target sz name <<< "$entry"
+            if [[ "$type" == "PATH" ]]; then
+                printf "%-20s %-15s %s\n" "$name" "$(format_size "$sz")" "$target"
+            else
+                printf "%-20s %-15s %s\n" "$name" "[Command]" "$target"
+            fi
+        done
+        echo ""
+        log "Total Reclaimable Space (Paths): $(format_size "$TOTAL_RECLAIMABLE_KB")"
+    fi
+    exit 0
+fi
+
+# Confirmation
+if [[ ${#DETECTED_ITEMS[@]} -eq 0 ]]; then
+    success "Nothing found to clean."
+    exit 0
+fi
+
+header "Cleanup Summary"
+log "Estimated space to reclaim: $(format_size "$TOTAL_RECLAIMABLE_KB")"
+warn "Note: Command-based cleanups (e.g. brew, docker) are not included in the estimate."
+[[ "$DRY_RUN" == true ]] && warn "DRY-RUN MODE ENABLED - No changes will be made"
+
+if [[ "$DRY_RUN" == false && "$FORCE" == false ]]; then
+    echo -ne "${BOLD}${YELLOW}Proceed with cleanup? (y/N): ${NC}"
+    read -r confirm || confirm="n"
     [[ "$confirm" =~ ^[Yy]$ ]] || { error "Aborted."; exit 1; }
 fi
 
-# Capture disk free space before cleanup (in KB)
-INITIAL_FREE_SPACE=$(df -k / | tail -1 | awk '{print $4}')
-
-# --- Execution ---
-
-if $CLEAN_ALL || $CLEAN_XCODE; then
-    header "Xcode & iOS Development"
-    cleanup_item "$XCODE_DIR/DerivedData/*" "Xcode DerivedData"
-    cleanup_item "$XCODE_DIR/Archives/*" "Xcode Archives"
-    cleanup_item "$XCODE_DIR/iOS DeviceSupport/*" "iOS DeviceSupport"
-    cleanup_item "$XCODE_DIR/Logs/*" "Xcode Logs"
-    cleanup_item "$CACHE_DIR/com.apple.dt.Xcode" "Xcode Caches"
-fi
-
-if $CLEAN_ALL || $CLEAN_SIM; then
-    header "iOS Simulators"
-    cleanup_item "$SIM_DIR/Caches" "Simulator Caches"
-    cleanup_item "$SIM_DIR/Devices/*/data/Library/Caches" "Simulator Device Caches"
-fi
-
-if $CLEAN_ALL || $CLEAN_BREW; then
-    if command_exists brew; then
-        header "Homebrew"
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: brew cleanup"
-        else
-            log "Running brew cleanup..."
-            brew cleanup -s
-            brew bundle cleanup --force 2>/dev/null || true
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_PODS; then
-    if command_exists pod; then
-        header "CocoaPods"
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: pod cache clean --all"
-        else
-            log "Cleaning CocoaPods cache..."
-            pod cache clean --all
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_NODE; then
-    header "NPM & Yarn"
-    if command_exists npm; then
-        cleanup_item "$HOME/.npm/_cacache" "NPM Cache"
-    fi
-    if command_exists yarn; then
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: yarn cache clean"
-        else
-            log "Cleaning Yarn cache..."
-            yarn cache clean
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_BUN; then
-    if command_exists bun; then
-        header "Bun"
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: bun pm cache clean"
-        else
-            log "Cleaning Bun cache..."
-            bun pm cache clean 2>/dev/null || true
-            cleanup_item "$HOME/.bun/install/cache/*" "Bun Install Cache"
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_PNPM; then
-    if command_exists pnpm; then
-        header "pnpm"
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: pnpm store prune"
-        else
-            log "Pruning pnpm store..."
-            pnpm store prune 2>/dev/null || true
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_GO; then
-    if command_exists go; then
-        header "Go"
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: go clean -cache -modcache"
-        else
-            log "Cleaning Go cache..."
-            go clean -cache -modcache 2>/dev/null || true
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_PUB; then
-    header "Dart & Pub"
-    if command_exists flutter; then
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: flutter pub cache clean"
-        else
-            log "Cleaning Flutter pub cache..."
-            flutter pub cache clean --force 2>/dev/null || true
-        fi
-    elif command_exists dart; then
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: dart pub cache clean"
-        else
-            log "Cleaning Dart pub cache..."
-            dart pub cache clean --force 2>/dev/null || true
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_SWIFT; then
-    header "Swift PM"
-    cleanup_item "$CACHE_DIR/org.swift.swiftpm" "Swift PM Cache"
-    cleanup_item "$HOME/Library/Developer/Xcode/DerivedData/*/SourcePackages" "Swift PM Source Packages"
-fi
-
-if $CLEAN_ALL || $CLEAN_VSCODE; then
-    header "VS Code"
-    cleanup_item "$HOME/Library/Application Support/Code/Cache/*" "VS Code Cache"
-    cleanup_item "$HOME/Library/Application Support/Code/CachedData/*" "VS Code CachedData"
-    cleanup_item "$HOME/Library/Application Support/Code/logs/*" "VS Code Logs"
-fi
-
-if $CLEAN_ALL || $CLEAN_DOCKER; then
-    if command_exists docker; then
-        header "Docker"
-        if [ "$DRY_RUN" = true ]; then
-            log "[Dry-Run] Would run: docker system prune -f -a"
-        else
-            log "Pruning Docker (images, containers, networks)..."
-            docker system prune -f -a 2>/dev/null || true
-        fi
-    fi
-fi
-
-if $CLEAN_ALL || $CLEAN_ANDROID; then
-    header "Android & Gradle"
-    cleanup_item "$HOME/.gradle/caches" "Gradle Caches"
-    cleanup_item "$HOME/.android/build-cache" "Android Build Cache"
-    cleanup_item "$CACHE_DIR/Google/AndroidStudio*" "Android Studio Caches"
-fi
-
-if $CLEAN_ALL || $CLEAN_CACHES; then
-    header "System & App Caches"
-    cleanup_item "$CACHE_DIR/*" "General User Caches"
-    cleanup_item "$LOG_DIR/*" "User Logs"
-    cleanup_item "$CACHE_DIR/Slack" "Slack Cache"
-    cleanup_item "$CACHE_DIR/com.spotify.client" "Spotify Cache"
+# Cleanup
+ACTUAL_RECLAIMED_KB=0
+for entry in "${DETECTED_ITEMS[@]}"; do
+    IFS='|' read -r mod type target sz name <<< "$entry"
     
-    header "Trash"
-    cleanup_item "$HOME/.Trash/*" "System Trash"
-fi
+    if [[ "$type" == "CMD" ]]; then
+        run_cleanup_cmd "$target" "$name"
+    else
+        if validate_path "$target" || [[ "$FORCE" == true ]]; then
+            if $DRY_RUN; then
+                log "[Dry-Run] Would remove path: $target ($(format_size "$sz"))"
+                ACTUAL_RECLAIMED_KB=$((ACTUAL_RECLAIMED_KB + sz))
+            else
+                log "Cleaning $name: $target ($(format_size "$sz"))..."
+                # Use sh -c for wildcard expansion if necessary
+                if [[ "$target" == *"*"* ]]; then
+                    sh -c "rm -rf $target" 2>/dev/null || warn "Failed to clean: $target"
+                else
+                    rm -rf "$target" 2>/dev/null || warn "Failed to clean: $target"
+                fi
+                ACTUAL_RECLAIMED_KB=$((ACTUAL_RECLAIMED_KB + sz))
+            fi
+        else
+            warn "Skipping potentially unsafe path: $target"
+        fi
+    fi
+done
 
-# --- Finalize ---
-header "Summary"
-if [ "$DRY_RUN" = true ]; then
-    success "Dry run complete. No files were deleted."
+header "Final Summary"
+if $DRY_RUN; then
+    success "Dry run complete. Potential space to reclaim: $(format_size "$ACTUAL_RECLAIMED_KB")"
 else
-    # Capture disk free space after cleanup
-    FINAL_FREE_SPACE=$(df -k / | tail -1 | awk '{print $4}')
-    
-    # Calculate difference
-    RECLAIMED_KB=$((FINAL_FREE_SPACE - INITIAL_FREE_SPACE))
-    
-    # Ensure we don't show negative values if some other process consumed space
-    if [ "$RECLAIMED_KB" -lt 0 ]; then
-        RECLAIMED_KB=0
-    fi
-    
-    success "Cleanup complete! Total disk space reclaimed: $(format_size $RECLAIMED_KB)"
+    success "Cleanup complete! Total disk space reclaimed: ~$(format_size "$ACTUAL_RECLAIMED_KB")"
 fi
+
+exit 0
